@@ -62,6 +62,16 @@ public class AuditAccessControl {
                 "当前角色无权导出审计记录，导出仅限 ADMIN 角色");
     }
 
+    /** 完整性校验：与查询同级，AUDITOR 与 ADMIN 可执行。 */
+    public void checkIntegrityVerify(AuditUser user) {
+        checkAuthenticated(user);
+        if (hasRole(user, Roles.ADMIN) || hasRole(user, Roles.AUDITOR)) {
+            return;
+        }
+        throw new AuditAccessDeniedException(AccessDeniedReason.EXPORT_FORBIDDEN,
+                "当前角色无权执行完整性校验，仅限 AUDITOR 或 ADMIN 角色");
+    }
+
     private boolean hasRole(AuditUser user, String role) {
         return user.roles() != null && user.roles().contains(role);
     }

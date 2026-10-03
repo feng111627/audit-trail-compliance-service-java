@@ -83,12 +83,15 @@ public class InMemoryAuditEventRepository implements AuditEventRepository {
         long count = 0;
         for (AuditEvent event : store.values()) {
             if (event.timestamp().isBefore(cutoff)) {
+                // 保留链字段（chainIndex/previousHash/eventHash），匿名化哈希由服务层重算后回写
                 AuditEvent anonymized = new AuditEvent(
                         event.eventId(), event.requestId(), event.sequence(),
                         "deleted@retention", event.action(), event.resourceType(),
                         event.resourceId(), Map.of(), event.result(),
                         event.reason() == null ? null : "expired:" + event.reason(),
-                        event.timestamp(), event.durationMillis(), event.async());
+                        event.timestamp(), event.durationMillis(), event.async(),
+                        event.chainIndex(), event.previousHash(), event.eventHash(),
+                        event.anonymizedHash());
                 store.put(event.eventId(), anonymized);
                 count++;
             }
@@ -109,5 +112,86 @@ public class InMemoryAuditEventRepository implements AuditEventRepository {
                         .thenComparingLong(AuditEvent::sequence))
                 .limit(Math.max(1, Math.min(limit, 500)))
                 .toList();
+    }
+
+    @Override
+    public Optional<AuditEvent> findLatestChained() {
+        return store.values().stream()
+                .filter(AuditEvent::isChained)
+                .max(Comparator.comparingLong(AuditEvent::chainIndex));
+    }
+
+    @Override
+    public List<AuditEvent> findChainedFrom(long fromChainIndexInclusive, int limit) {
+        return store.values().stream()
+                .filter(AuditEvent::isChained)
+                .filter(e -> e.chainIndex() >= fromChainIndexInclusive)
+                .sorted(Comparator.comparingLong(AuditEvent::chainIndex))
+                .limit(Math.max(1, limit))
+                .toList();
+    }
+
+    @Override
+    public Optional<AuditEvent> findByChainIndex(long chainIndex) {
+        return store.values().stream()
+                .filter(AuditEvent::isChained)
+                .filter(e -> e.chainIndex() == chainIndex)
+                .findFirst();
+    }
+
+    @Override
+    public List<AuditEvent> findOlderThan(Instant cutoff) {
+        return store.values().stream()
+                .filter(e -> e.timestamp().isBefore(cutoff))
+                .toList();
+    }
+
+    @Override
+    public void updateAnonymizedHash(String eventId, String anonymizedHash) {
+        store.computeIfPresent(eventId, (id, event) -> new AuditEvent(
+                event.eventId(), event.requestId(), event.sequence(),
+                event.actor(), event.action(), event.resourceType(), event.resourceId(),
+                event.parameters(), event.result(), event.reason(),
+                event.timestamp(), event.durationMillis(), event.async(),
+                event.chainIndex(), event.previousHash(), event.eventHash(),
+                anonymizedHash));
+    }
+
+    /**
+     * 模拟“绕过接口直接改库”的写入（仅用于测试/演示篡改场景），
+     * 不经过任何服务层校验直接覆盖已有记录。
+     */
+    public void unsafeReplace(AuditEvent event) {
+        store.put(event.eventId(), event);
+    }
+
+    /** 模拟“绕过接口直接删库”（仅用于测试/演示篡改场景）。 */
+    public void unsafeDelete(String eventId) {
+        store.remove(eventId);
+    }
+
+    @Override
+    public Optional<AuditEvent> findFirstChainedAtOrAfter(Instant from) {
+        return store.values().stream()
+                .filter(AuditEvent::isChained)
+                .filter(e -> !e.timestamp().isBefore(from))
+                .min(Comparator.comparingLong(AuditEvent::chainIndex));
+    }
+
+    @Override
+    public Optional<AuditEvent> findLastChainedAtOrBefore(Instant to) {
+        return store.values().stream()
+                .filter(AuditEvent::isChained)
+                .filter(e -> !e.timestamp().isAfter(to))
+                .max(Comparator.comparingLong(AuditEvent::chainIndex));
+    }
+
+    @Override
+    public long countLegacy(Instant from, Instant to) {
+        return store.values().stream()
+                .filter(e -> !e.isChained())
+                .filter(e -> from == null || !e.timestamp().isBefore(from))
+                .filter(e -> to == null || !e.timestamp().isAfter(to))
+                .count();
     }
 }

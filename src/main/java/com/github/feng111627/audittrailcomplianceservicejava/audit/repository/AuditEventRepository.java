@@ -27,4 +27,27 @@ public interface AuditEventRepository {
     long countAll();
 
     List<AuditEvent> findAllOrdered(int limit);
+
+    /** 链上序号最大的入链记录（链尾），无入链记录时为空。 */
+    Optional<AuditEvent> findLatestChained();
+
+    /** 从某个链上序号起（含）按链序分批取入链记录，供完整性校验流式扫描。 */
+    List<AuditEvent> findChainedFrom(long fromChainIndexInclusive, int limit);
+
+    Optional<AuditEvent> findByChainIndex(long chainIndex);
+
+    /** 按过期时间查出记录（留存清理前用于登记墓碑/重算匿名化哈希）。 */
+    List<AuditEvent> findOlderThan(Instant cutoff);
+
+    /** 留存匿名化后回写按新内容重算的哈希，eventHash 保持不变。 */
+    void updateAnonymizedHash(String eventId, String anonymizedHash);
+
+    /** 时间 >= from 的第一条（链上序号最小）入链记录。 */
+    Optional<AuditEvent> findFirstChainedAtOrAfter(Instant from);
+
+    /** 时间 <= to 的最后一条（链上序号最大）入链记录。 */
+    Optional<AuditEvent> findLastChainedAtOrBefore(Instant to);
+
+    /** 指定时间范围内未入链的历史遗留记录数（from/to 为 null 表示不限）。 */
+    long countLegacy(Instant from, Instant to);
 }

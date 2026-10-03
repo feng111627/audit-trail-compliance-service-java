@@ -2,6 +2,9 @@ package com.github.feng111627.audittrailcomplianceservicejava.audit.service;
 
 import com.github.feng111627.audittrailcomplianceservicejava.audit.config.AuditProperties;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.context.AuditContext;
+import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.HashChainService;
+import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.InMemoryPurgeTombstoneStore;
+import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.PurgeTombstoneStore;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.masking.MaskingService;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.model.AuditEvent;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.model.AuditPage;
@@ -12,8 +15,10 @@ import com.github.feng111627.audittrailcomplianceservicejava.audit.security.Audi
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 /**
@@ -29,15 +34,35 @@ public class DefaultAuditService implements AuditService {
     private final MaskingService maskingService;
     private final AuditAccessControl accessControl;
     private final AuditProperties properties;
+    private final HashChainService hashChainService;
+    private final PurgeTombstoneStore tombstoneStore;
+    private final HashService hashService;
 
+    @Autowired
     public DefaultAuditService(AuditEventRepository repository,
                                MaskingService maskingService,
                                AuditAccessControl accessControl,
-                               AuditProperties properties) {
+                               AuditProperties properties,
+                               HashChainService hashChainService,
+                               PurgeTombstoneStore tombstoneStore,
+                               HashService hashService) {
         this.repository = repository;
         this.maskingService = maskingService;
         this.accessControl = accessControl;
         this.properties = properties;
+        this.hashChainService = hashChainService;
+        this.tombstoneStore = tombstoneStore;
+        this.hashService = hashService;
+    }
+
+    /** 兼容旧构造：不显式提供链组件时自建默认实现（历史单测直接用）。 */
+    public DefaultAuditService(AuditEventRepository repository,
+                               MaskingService maskingService,
+                               AuditAccessControl accessControl,
+                               AuditProperties properties) {
+        this(repository, maskingService, accessControl, properties,
+                new HashChainService(repository, new HashService()),
+                new InMemoryPurgeTombstoneStore(), new HashService());
     }
 
     @Override
@@ -84,8 +109,8 @@ public class DefaultAuditService implements AuditService {
                 durationMillis,
                 AuditContext.isAsync());
 
-        repository.saveIfAbsent(event);
-        return repository.findByEventId(eventId).orElse(event);
+        // 接入防篡改哈希链并幂等落库；重试时返回库中已有记录，链状态不变
+        return hashChainService.append(event);
     }
 
     private static String truncateReason(String reason) {
@@ -133,8 +158,27 @@ public class DefaultAuditService implements AuditService {
     public long purgeExpired() {
         AuditProperties.Retention retention = properties.getRetention();
         Instant cutoff = Instant.now().minus(Duration.ofDays(retention.getDays()));
+        // 先取出将被清理的记录：DELETE 需登记墓碑，ANONYMIZE 需重算匿名化哈希
+        List<AuditEvent> expired = repository.findOlderThan(cutoff);
         if ("ANONYMIZE".equalsIgnoreCase(retention.getPurgeMode())) {
-            return repository.anonymizeOlderThan(cutoff);
+            long purged = repository.anonymizeOlderThan(cutoff);
+            // 匿名化改变了内容，按新内容重算哈希回写，eventHash 不动，链关联保持完整
+            for (AuditEvent before : expired) {
+                if (!before.isChained()) {
+                    continue;
+                }
+                repository.findByEventId(before.eventId()).ifPresent(anonymized ->
+                        repository.updateAnonymizedHash(anonymized.eventId(),
+                                hashService.contentHash(anonymized, anonymized.previousHash())));
+            }
+            return purged;
+        }
+        // DELETE：为每条被物理删除的入链记录登记墓碑（chainIndex -> eventHash），
+        // 校验时据此把“正常清理的缺口”与“被人为删除/篡改”区分开
+        for (AuditEvent event : expired) {
+            if (event.isChained()) {
+                tombstoneStore.put(event.chainIndex(), event.eventHash());
+            }
         }
         return repository.deleteOlderThan(cutoff);
     }

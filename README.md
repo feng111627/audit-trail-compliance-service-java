@@ -95,7 +95,81 @@ audit.retention.purge-on-startup=false
 
 定时任务见 `RetentionService`。当前仓储为内存实现（`InMemoryAuditEventRepository`），生产可实现 `AuditEventRepository` 替换为 JPA/ES，并在 `event_id` 上建唯一索引承接幂等语义。
 
-## 6. 本地验证
+## 6. 防篡改链与完整性校验
+
+光“记下来”还不够，这层能力让记录**事后被改动可被发现、可定位**。
+
+### 6.1 怎么定义的
+
+每条新记录落库前由 `HashChainService` 接入一条哈希链（`audit/integrity/`）：
+
+- `chainIndex`：链内序号，从 0 开始严格递增；
+- `previousHash`：前一条入链记录的 `eventHash`，链首为常量 `GENESIS`；
+- `eventHash`：`SHA-256(规范化内容 + previousHash)`，写入后**不再变化**（匿名化也不改）；
+- `anonymizedHash`：留存匿名化后按新内容重算的哈希（未匿名化为 `null`）。
+
+因为每条都“咬住”前一条，任何人事后绕过接口直接改库/删库，都会在校验时暴露：
+
+| 异常类型 | 含义 |
+|---|---|
+| `CONTENT_TAMPERED` | 记录内容与落库时的哈希对不上（内容被改） |
+| `CHAIN_LINK_BROKEN` | `previousHash` 与前序记录对不上（链被断开/重排） |
+| `RECORD_MISSING` | 链上序号缺失且无正常清理墓碑（记录被人为删除，含链尾被截断） |
+| `ANONYMIZATION_INVALID` | 带匿名化哈希但内容不像正常匿名化产物（借匿名化掩盖篡改） |
+
+### 6.2 校验入口
+
+```
+GET /api/audit/integrity/verify?from=...&to=...&fromIndex=...&toIndex=...
+```
+
+- 时间范围 `from`/`to`（ISO-8601）或链上序号范围 `fromIndex`/`toIndex`，都不传则校验整条链；
+- 仅 `AUDITOR` / `ADMIN` 可调用；
+- 返回 `IntegrityReport`：`intact`（整体是否完整）、`scannedCount`/`chainedCount`（本次覆盖记录数）、`legacyCount`/`purgedCount`/`anonymizedCount`（统计），以及**第一处异常**的 `anomalyType` / `anomalyChainIndex` / `anomalyEventId` / `anomalyMessage`——不是只丢一句“校验失败”。
+
+实现上（`IntegrityVerificationService`）：按链序**分批流式**扫描（每批 200 条），内存中只持有一批，数据量大也跑得动；校验只读快照、逐条重算比对，**不加写锁**，不阻塞正常留痕写入。写入侧只在“算哈希 + 幂等落库”的极短临界区内持锁，不拖慢线上写路径。
+
+### 6.3 对历史记录与正常清理的兼容
+
+- **历史遗留**：上线前已存在的记录没有链字段（`chainIndex=-1`、哈希为 `null`），校验时只统计为 `legacyCount`，**不算篡改**；新记录从 `chainIndex=0` 另起新链。
+- **正常清理（DELETE）**：`purgeExpired` 物理删除入链记录前，先登记“墓碑”（`chainIndex -> eventHash`，见 `PurgeTombstoneStore`）。校验遇到链上缺口时，有墓碑且哈希吻合 → 计为 `purgedCount`；无墓碑 → 报 `RECORD_MISSING`。“正常清理”与“被人为删除”由此区分。
+- **正常清理（ANONYMIZE）**：匿名化后按新内容重算 `anonymizedHash` 回写，`eventHash` 不动，链关联保持完整；校验对匿名化记录比对 `anonymizedHash`，并要求内容确实呈匿名化形态。
+- **并发与重试**：链尾推进与幂等落库在同一短锁内完成，多线程并发序号不重不漏；同一 `requestId` 重试产生相同 `eventId`，`saveIfAbsent` 兜底只落一条、链不重复推进。
+
+### 6.4 本地验证
+
+```bash
+# 跑全部测试（含防篡改链 10 个用例 + 校验入口权限 4 个用例）
+mvn test
+
+# 只看防篡改相关用例
+mvn test -Dtest=HashChainIntegrityTest
+```
+
+手工验证（先 `mvn spring-boot:run`，另开终端）：
+
+```bash
+# 1) 产生几条留痕
+curl -s -X POST http://localhost:$PORT/api/orders \
+  -H 'Content-Type: application/json' -H 'X-User: alice' -H 'X-Roles: USER' \
+  -d '{"owner":"alice","product":"book","phone":"13812341234","payPassword":"paypass"}'
+
+# 2) 审计员跑全链校验 -> intact=true，含覆盖统计
+curl -s http://localhost:$PORT/api/audit/integrity/verify \
+  -H 'X-User: auditor' -H 'X-Roles: AUDITOR'
+
+# 3) 普通用户调用 -> 403
+curl -s http://localhost:$PORT/api/audit/integrity/verify \
+  -H 'X-User: bob' -H 'X-Roles: USER'
+
+# 4) 按链上序号范围校验
+curl -s 'http://localhost:$PORT/api/audit/integrity/verify?fromIndex=0&toIndex=2' \
+  -H 'X-User: root' -H 'X-Roles: ADMIN'
+```
+
+篡改/删除的检出效果由自动化用例覆盖（`HashChainIntegrityTest` 中用仓储的 `unsafeReplace`/`unsafeDelete` 测试钩子模拟绕过接口直接改库/删库）。
+
+## 7. 本地验证
 
 ### 运行测试（推荐）
 
@@ -103,7 +177,7 @@ audit.retention.purge-on-startup=false
 mvn test
 ```
 
-控制台会按“业务点”打印每个用例的通过情况，覆盖：正常留痕、失败与异常、并发与异步归属、脱敏、越权、留存策略（共 27 个用例）。
+控制台会按“业务点”打印每个用例的通过情况，覆盖：正常留痕、失败与异常、并发与异步归属、脱敏、越权、留存策略、防篡改链与完整性校验（共 41 个用例）。
 
 ### 启动服务手工验证
 
@@ -134,7 +208,7 @@ curl -s http://localhost:$PORT/api/audit/events/export -H 'X-User: auditor' -H '
 curl -s http://localhost:$PORT/api/audit/events/export -H 'X-User: root' -H 'X-Roles: ADMIN'
 ```
 
-## 7. 代码结构
+## 8. 代码结构
 
 ```
 audit/
@@ -143,9 +217,10 @@ audit/
   context/      AuditContext（requestId/序列号，异步快照传播）
   masking/      脱敏服务
   security/     角色、访问控制、可区分拒绝原因
-  repository/   审计仓储接口与内存实现（幂等、查询、过期处理）
-  service/      留痕服务、留存清理
-  web/          上下文/鉴权过滤器、审计查询接口、全局异常处理
+  repository/   审计仓储接口与内存实现（幂等、查询、过期处理、链式读取）
+  integrity/    防篡改哈希链、清理墓碑、完整性校验与报告
+  service/      留痕服务、留存清理、哈希计算
+  web/          上下文/鉴权过滤器、审计查询接口、完整性校验入口、全局异常处理
   config/       配置属性、异步线程池、定时开关
 demo/           订单业务（@Audited 使用示例）与 HTTP 入口
 ```
