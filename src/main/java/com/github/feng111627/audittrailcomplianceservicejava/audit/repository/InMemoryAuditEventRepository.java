@@ -79,8 +79,8 @@ public class InMemoryAuditEventRepository implements AuditEventRepository {
     }
 
     @Override
-    public long anonymizeOlderThan(Instant cutoff) {
-        long count = 0;
+    public List<AuditEvent> anonymizeOlderThan(Instant cutoff) {
+        List<AuditEvent> anonymizedEvents = new java.util.ArrayList<>();
         for (AuditEvent event : store.values()) {
             if (event.timestamp().isBefore(cutoff)) {
                 AuditEvent anonymized = new AuditEvent(
@@ -90,15 +90,23 @@ public class InMemoryAuditEventRepository implements AuditEventRepository {
                         event.reason() == null ? null : "expired:" + event.reason(),
                         event.timestamp(), event.durationMillis(), event.async());
                 store.put(event.eventId(), anonymized);
-                count++;
+                anonymizedEvents.add(anonymized);
             }
         }
-        return count;
+        return anonymizedEvents;
     }
 
     @Override
     public long countAll() {
         return store.size();
+    }
+
+    /**
+     * 模拟“绕过接口直接改库”的覆盖写：仅用于测试/演示防篡改校验，
+     * 正常业务路径不会调用（接口本身也不暴露此方法）。
+     */
+    public void forceReplace(AuditEvent event) {
+        store.put(event.eventId(), event);
     }
 
     @Override
@@ -109,5 +117,20 @@ public class InMemoryAuditEventRepository implements AuditEventRepository {
                         .thenComparingLong(AuditEvent::sequence))
                 .limit(Math.max(1, Math.min(limit, 500)))
                 .toList();
+    }
+
+    @Override
+    public List<AuditEvent> findByTimestampBetween(Instant from, Instant to, long offset, int limit) {
+        List<AuditEvent> matched = store.values().stream()
+                .filter(e -> !e.timestamp().isBefore(from) && !e.timestamp().isAfter(to))
+                .sorted(Comparator.comparing(AuditEvent::timestamp)
+                        .thenComparing(AuditEvent::requestId)
+                        .thenComparingLong(AuditEvent::sequence))
+                .toList();
+        int safeLimit = Math.max(1, Math.min(limit, 500));
+        long safeOffset = Math.max(0, offset);
+        int fromIdx = (int) Math.min(safeOffset, matched.size());
+        int toIdx = (int) Math.min(fromIdx + safeLimit, matched.size());
+        return matched.subList(fromIdx, toIdx);
     }
 }

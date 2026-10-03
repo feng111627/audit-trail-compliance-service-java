@@ -2,6 +2,11 @@ package com.github.feng111627.audittrailcomplianceservicejava.audit.service;
 
 import com.github.feng111627.audittrailcomplianceservicejava.audit.config.AuditProperties;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.context.AuditContext;
+import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.AnonymizationRegistry;
+import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.AuditEventHash;
+import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.HashChainService;
+import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.InMemoryAnonymizationRegistry;
+import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.InMemoryChainEntryRepository;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.masking.MaskingService;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.model.AuditEvent;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.model.AuditPage;
@@ -12,8 +17,10 @@ import com.github.feng111627.audittrailcomplianceservicejava.audit.security.Audi
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 /**
@@ -29,15 +36,32 @@ public class DefaultAuditService implements AuditService {
     private final MaskingService maskingService;
     private final AuditAccessControl accessControl;
     private final AuditProperties properties;
+    private final HashChainService hashChainService;
+    private final AnonymizationRegistry anonymizationRegistry;
 
+    @Autowired
     public DefaultAuditService(AuditEventRepository repository,
                                MaskingService maskingService,
                                AuditAccessControl accessControl,
-                               AuditProperties properties) {
+                               AuditProperties properties,
+                               HashChainService hashChainService,
+                               AnonymizationRegistry anonymizationRegistry) {
         this.repository = repository;
         this.maskingService = maskingService;
         this.accessControl = accessControl;
         this.properties = properties;
+        this.hashChainService = hashChainService;
+        this.anonymizationRegistry = anonymizationRegistry;
+    }
+
+    /** 便捷构造：不带外部链组件时使用独立的内存链（主要供不关注防篡改的既有单测）。 */
+    public DefaultAuditService(AuditEventRepository repository,
+                               MaskingService maskingService,
+                               AuditAccessControl accessControl,
+                               AuditProperties properties) {
+        this(repository, maskingService, accessControl, properties,
+                new HashChainService(new InMemoryChainEntryRepository()),
+                new InMemoryAnonymizationRegistry());
     }
 
     @Override
@@ -84,7 +108,11 @@ public class DefaultAuditService implements AuditService {
                 durationMillis,
                 AuditContext.isAsync());
 
-        repository.saveIfAbsent(event);
+        boolean saved = repository.saveIfAbsent(event);
+        if (saved) {
+            // 只有真正落库的新记录才入链；同一 eventId 的重试不会产生重复环节点。
+            hashChainService.appendIfNew(event);
+        }
         return repository.findByEventId(eventId).orElse(event);
     }
 
@@ -134,7 +162,15 @@ public class DefaultAuditService implements AuditService {
         AuditProperties.Retention retention = properties.getRetention();
         Instant cutoff = Instant.now().minus(Duration.ofDays(retention.getDays()));
         if ("ANONYMIZE".equalsIgnoreCase(retention.getPurgeMode())) {
-            return repository.anonymizeOlderThan(cutoff);
+            List<AuditEvent> anonymized = repository.anonymizeOlderThan(cutoff);
+            // 正常匿名化会改变记录内容，登记匿名化后的内容哈希，
+            // 供完整性校验把“按策略匿名化”与“被篡改”区分开。
+            for (AuditEvent event : anonymized) {
+                hashChainService.latestAnonymizedAnchor(event.eventId())
+                        .ifPresent(previousHash -> anonymizationRegistry.register(
+                                event.eventId(), AuditEventHash.compute(event, previousHash)));
+            }
+            return anonymized.size();
         }
         return repository.deleteOlderThan(cutoff);
     }

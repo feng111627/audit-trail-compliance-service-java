@@ -21,10 +21,13 @@ public interface AuditEventRepository {
 
     long deleteOlderThan(Instant cutoff);
 
-    /** 将过期记录匿名化（actor 置为 deleted@retention、参数清空），记录本身保留。 */
-    long anonymizeOlderThan(Instant cutoff);
+    /** 将过期记录匿名化（actor 置为 deleted@retention、参数清空），记录本身保留。返回被匿名化的记录。 */
+    List<AuditEvent> anonymizeOlderThan(Instant cutoff);
 
     long countAll();
 
     List<AuditEvent> findAllOrdered(int limit);
+
+    /** 按落库时间范围分页查询（闭区间），供完整性校验分批流式扫描，避免全量进内存。 */
+    List<AuditEvent> findByTimestampBetween(Instant from, Instant to, long offset, int limit);
 }
