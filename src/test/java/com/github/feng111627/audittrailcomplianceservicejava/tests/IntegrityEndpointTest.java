@@ -59,6 +59,36 @@ class IntegrityEndpointTest {
     }
 
     @Test
+    @DisplayName("按链上位置区间校验：200，返回区间覆盖量")
+    void verifyWithPositionRange() throws Exception {
+        mockMvc.perform(get("/api/audit/integrity/verify-range")
+                        .param("fromPosition", "1").param("toPosition", "10")
+                        .header("X-User", "auditor").header("X-Roles", Roles.AUDITOR))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.intact").isBoolean())
+                .andExpect(jsonPath("$.checkedPositions").isNumber());
+    }
+
+    @Test
+    @DisplayName("位置区间参数不合法（toPosition < fromPosition）：400")
+    void verifyWithInvalidPositionRange() throws Exception {
+        mockMvc.perform(get("/api/audit/integrity/verify-range")
+                        .param("fromPosition", "5").param("toPosition", "2")
+                        .header("X-User", "auditor").header("X-Roles", Roles.AUDITOR))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("普通用户按区间校验：403 且 reason=INTEGRITY_VERIFY_FORBIDDEN")
+    void userVerifyRangeRejected() throws Exception {
+        mockMvc.perform(get("/api/audit/integrity/verify-range")
+                        .param("fromPosition", "1")
+                        .header("X-User", "bob").header("X-Roles", Roles.USER))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.reason").value("INTEGRITY_VERIFY_FORBIDDEN"));
+    }
+
+    @Test
     @DisplayName("普通用户发起校验：403 且 reason=INTEGRITY_VERIFY_FORBIDDEN")
     void userVerifyRejected() throws Exception {
         mockMvc.perform(get("/api/audit/integrity/verify")

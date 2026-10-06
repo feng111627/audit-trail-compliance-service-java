@@ -86,6 +86,14 @@ public class GlobalExceptionHandler {
                 "message", ex.getMessage()));
     }
 
+    /** 参数非法（如校验区间 fromPosition/toPosition 不合法）：明确 400。 */
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<Map<String, Object>> handleBadRequest(IllegalArgumentException ex) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of(
+                "result", OperationResult.FAILED.name(),
+                "reason", ex.getMessage()));
+    }
+
     /** 未预期异常：系统中断。 */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, Object>> handleUnexpected(Exception ex) {
