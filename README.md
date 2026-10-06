@@ -78,7 +78,8 @@
 - `GET /api/audit/events`：条件查询（requestId/actor/action/resourceType/resourceId + limit/offset）
 - `GET /api/audit/events/{eventId}`：读取单条
 - `GET /api/audit/events/export`：导出（仅 ADMIN）
-- `GET /api/audit/integrity/verify`：完整性校验（仅 AUDITOR/ADMIN，见第 6 节）
+- `GET /api/audit/integrity/verify`：按时间范围完整性校验（仅 AUDITOR/ADMIN，见第 6 节）
+- `GET /api/audit/integrity/verify/range`：按链上位置区间校验（仅 AUDITOR/ADMIN，见第 6 节）
 
 ## 5. 留存时长与过期处理
 
@@ -105,10 +106,12 @@ audit.retention.purge-on-startup=false
 - 每条新记录**真正落库后**（`saveIfAbsent` 成功）追加为哈希链上的一环（`ChainEntry`）：
   `entryHash = SHA-256(记录内容规范化串 + 上一环 entryHash)`，首环的前驱为全零 `GENESIS`。
   每一环都依赖之前所有落库记录，形成可验证的先后关联。
-- 事后任何人绕过接口直接改库（改内容、删环节、换环节），校验时都会暴露：
+- 事后任何人绕过接口直接改库（改内容、删记录、删环节、换环节），校验时都会暴露：
   - 内容被改 → 重算哈希与链上登记值不一致（`HASH_MISMATCH`）；
-  - 环节被删/换/重排 → 相邻环哈希衔接断开（`CHAIN_LINK_BROKEN`）。
-- 校验报告会**精确定位第一处对不上的位置**（链上 position + eventId + 异常类型），不是只丢一句“校验失败”。
+  - 环节被删/换/重排 → 相邻环哈希衔接断开（`CHAIN_LINK_BROKEN`）；
+  - 已入链的记录本体被整条删掉，且未登记为留存策略清理 → `RECORD_DELETED`，
+    **不会**被混进“正常清理的条数”里。
+- 校验报告会**精确定位第一处对不上的位置**（链上 position + eventId + 异常类型），不是只丢一句“校验失败”或一个条数。
 
 ### 并发与重试
 
@@ -123,13 +126,20 @@ audit.retention.purge-on-startup=false
 | 情况 | 报告字段 | 说明 |
 |---|---|---|
 | 历史遗留：上线前已落库、没有链上环节的记录 | `legacyCount` | 不算异常；只表示“还没纳入这层关联” |
-| 正常清理：记录已被留存策略物理删除 | `purgedCount` | 链上环节仍在、记录已不在，不算异常 |
+| 正常清理：记录被留存策略物理删除 | `purgedCount` | 删除时把 eventId 登记进 `PurgeRegistry`，校验只认登记过的；链上环节仍在、记录已不在，不算异常 |
 | 正常匿名化：记录被留存策略匿名化 | `anonymizedCount` | 匿名化时登记了“匿名化后内容哈希”，凭登记值通过校验；匿名化之后再被改动仍会被检出 |
+| 人为删除：记录本体消失且**未**登记为留存清理 | `firstAnomaly`（`RECORD_DELETED`） | 算异常，定位到被删那一环的 position/eventId |
+
+兼容边界一句话：**只认“登记过的正常行为”**。留存清理（删除/匿名化）在发生时登记，
+校验时凭登记放行；任何没有登记依据的缺失或改动，一律按篡改报出并定位。
 
 ### 校验入口
 
+两种范围都支持，可单独或组合使用：
+
 ```
-GET /api/audit/integrity/verify?from=<ISO-8601>&to=<ISO-8601>   # from/to 可省略，表示不限
+GET /api/audit/integrity/verify?from=<ISO-8601>&to=<ISO-8601>        # 按落库时间范围，from/to 可省略
+GET /api/audit/integrity/verify/range?fromPosition=1&toPosition=500  # 按链上位置区间（闭区间，均必填）
 ```
 
 仅限 `AUDITOR`/`ADMIN` 角色（普通用户 403 `INTEGRITY_VERIFY_FORBIDDEN`，未认证 401）。返回 `IntegrityReport`：
@@ -139,10 +149,11 @@ GET /api/audit/integrity/verify?from=<ISO-8601>&to=<ISO-8601>   # from/to 可省
   "intact": true,            // 范围内整体是否完整
   "verifiedCount": 120,      // 通过哈希校验的记录数（含匿名化的）
   "anonymizedCount": 3,      // 其中凭匿名化登记哈希通过的
-  "purgedCount": 5,          // 已被留存策略物理删除的链上环节数
-  "legacyCount": 2,          // 尚未入链的历史遗留记录数
+  "purgedCount": 5,          // 已登记为留存策略物理删除的链上环节数
+  "legacyCount": 2,          // 尚未入链的历史遗留记录数（按位置区间校验时恒为 0）
   "checkedPositions": 125,   // 本次实际检查的链上环节数（覆盖量）
-  "firstAnomaly": null       // 第一处异常；若有则含 position/eventId/type/detail
+  "firstAnomaly": null       // 第一处异常；若有则含 position/eventId/type/detail，
+                             // type ∈ HASH_MISMATCH / CHAIN_LINK_BROKEN / RECORD_DELETED
 }
 ```
 
@@ -154,7 +165,7 @@ GET /api/audit/integrity/verify?from=<ISO-8601>&to=<ISO-8601>   # from/to 可省
 mvn test
 ```
 
-控制台会按“业务点”打印每个用例的通过情况，覆盖：正常留痕、失败与异常、并发与异步归属、脱敏、越权、留存策略、防篡改哈希链与完整性校验（共 41 个用例）。
+控制台会按“业务点”打印每个用例的通过情况，覆盖：正常留痕、失败与异常、并发与异步归属、脱敏、越权、留存策略、防篡改哈希链与完整性校验（共 49 个用例）。其中防篡改部分含：人为删除/改动/整条替换的检出与定位、正常清理（删除/匿名化）不误报且与人为删除分开上报、按时间范围与按位置区间两种校验、并发写入与同一请求标识重试下关联不乱不重复。
 
 ### 启动服务手工验证
 
@@ -191,7 +202,11 @@ curl -s http://localhost:$PORT/api/audit/integrity/verify -H 'X-User: auditor' -
 curl -s "http://localhost:$PORT/api/audit/integrity/verify?from=2026-01-01T00:00:00Z" \
   -H 'X-User: root' -H 'X-Roles: ADMIN'
 
-# 8) 普通用户发起校验 -> 403 INTEGRITY_VERIFY_FORBIDDEN
+# 8) 按链上位置区间校验（第 1 环到第 100 环）
+curl -s "http://localhost:$PORT/api/audit/integrity/verify/range?fromPosition=1&toPosition=100" \
+  -H 'X-User: auditor' -H 'X-Roles: AUDITOR'
+
+# 9) 普通用户发起校验 -> 403 INTEGRITY_VERIFY_FORBIDDEN
 curl -s http://localhost:$PORT/api/audit/integrity/verify -H 'X-User: bob' -H 'X-Roles: USER'
 ```
 
@@ -206,7 +221,8 @@ audit/
   security/     角色、访问控制、可区分拒绝原因
   repository/   审计仓储接口与内存实现（幂等、查询、过期处理）
   integrity/    防篡改哈希链（ChainEntry/HashChainService）、完整性校验
-                （IntegrityVerificationService）、匿名化登记处
+                （IntegrityVerificationService）、匿名化登记处（AnonymizationRegistry）、
+                留存删除登记处（PurgeRegistry）
   service/      留痕服务、留存清理
   web/          上下文/鉴权过滤器、审计查询接口、完整性校验入口、全局异常处理
   config/       配置属性、异步线程池、定时开关

@@ -38,4 +38,15 @@ public class IntegrityController {
         accessControl.checkIntegrityVerify(AuditSecurityContext.get());
         return verificationService.verify(from, to);
     }
+
+    /**
+     * 校验链上位置在 [fromPosition, toPosition] 的环节（闭区间，均必填）。
+     * 返回整体是否完整、覆盖量与第一处异常位置。
+     */
+    @GetMapping("/verify/range")
+    public IntegrityReport verifyRange(@RequestParam long fromPosition,
+                                       @RequestParam long toPosition) {
+        accessControl.checkIntegrityVerify(AuditSecurityContext.get());
+        return verificationService.verifyRange(fromPosition, toPosition);
+    }
 }

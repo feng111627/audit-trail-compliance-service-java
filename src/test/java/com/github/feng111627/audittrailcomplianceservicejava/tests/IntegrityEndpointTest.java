@@ -59,6 +59,36 @@ class IntegrityEndpointTest {
     }
 
     @Test
+    @DisplayName("按位置区间校验：200，返回 intact 与覆盖量字段")
+    void verifyWithPositionRange() throws Exception {
+        // 先制造一条留痕，让链上至少有一环
+        mockMvc.perform(post("/api/orders")
+                        .header("X-User", "alice").header("X-Roles", Roles.USER)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"owner\":\"alice\",\"product\":\"book\","
+                                + "\"phone\":\"13812341234\",\"payPassword\":\"paypass\"}"))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(get("/api/audit/integrity/verify/range")
+                        .param("fromPosition", "1").param("toPosition", "100")
+                        .header("X-User", "auditor").header("X-Roles", Roles.AUDITOR))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.intact").value(true))
+                .andExpect(jsonPath("$.checkedPositions").isNumber())
+                .andExpect(jsonPath("$.verifiedCount").isNumber());
+    }
+
+    @Test
+    @DisplayName("按位置区间校验：普通用户同样被 403 拒绝")
+    void userVerifyRangeRejected() throws Exception {
+        mockMvc.perform(get("/api/audit/integrity/verify/range")
+                        .param("fromPosition", "1").param("toPosition", "10")
+                        .header("X-User", "bob").header("X-Roles", Roles.USER))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.reason").value("INTEGRITY_VERIFY_FORBIDDEN"));
+    }
+
+    @Test
     @DisplayName("普通用户发起校验：403 且 reason=INTEGRITY_VERIFY_FORBIDDEN")
     void userVerifyRejected() throws Exception {
         mockMvc.perform(get("/api/audit/integrity/verify")

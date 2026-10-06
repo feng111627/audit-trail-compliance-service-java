@@ -8,6 +8,7 @@ import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.Cha
 import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.HashChainService;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.InMemoryAnonymizationRegistry;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.InMemoryChainEntryRepository;
+import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.InMemoryPurgeRegistry;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.IntegrityReport;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.IntegrityReport.AnomalyType;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.IntegrityVerificationService;
@@ -32,8 +33,10 @@ import org.junit.jupiter.api.Test;
 
 /**
  * 业务点：防篡改哈希链与完整性校验。
- * 新记录与已落库记录建立可验证的先后关联；事后改库能检出并定位到第一条；
- * 历史遗留、正常清理（删除/匿名化）不误报；并发与重试下关联不乱、不重复、不断链。
+ * 新记录与已落库记录建立可验证的先后关联；事后改库/删库/换记录能检出并定位到第一条；
+ * 人为删除与留存策略正常清理（删除/匿名化）区分开、分开上报；
+ * 历史遗留不误报；支持按时间范围与按链上位置区间两种校验；
+ * 并发与重试下关联不乱、不重复、不断链。
  */
 @DisplayName("业务点-防篡改哈希链与完整性校验")
 class TamperEvidenceTest {
@@ -41,6 +44,7 @@ class TamperEvidenceTest {
     private InMemoryAuditEventRepository eventRepo;
     private InMemoryChainEntryRepository chainRepo;
     private InMemoryAnonymizationRegistry anonymizationRegistry;
+    private InMemoryPurgeRegistry purgeRegistry;
     private HashChainService chainService;
     private IntegrityVerificationService verificationService;
     private AuditProperties properties;
@@ -50,14 +54,17 @@ class TamperEvidenceTest {
         eventRepo = new InMemoryAuditEventRepository();
         chainRepo = new InMemoryChainEntryRepository();
         anonymizationRegistry = new InMemoryAnonymizationRegistry();
+        purgeRegistry = new InMemoryPurgeRegistry();
         chainService = new HashChainService(chainRepo);
-        verificationService = new IntegrityVerificationService(chainRepo, eventRepo, anonymizationRegistry);
+        verificationService = new IntegrityVerificationService(
+                chainRepo, eventRepo, anonymizationRegistry, purgeRegistry);
         properties = new AuditProperties();
     }
 
     private DefaultAuditService auditService() {
         return new DefaultAuditService(eventRepo, new DefaultMaskingService(),
-                new AuditAccessControl(), properties, chainService, anonymizationRegistry);
+                new AuditAccessControl(), properties, chainService, anonymizationRegistry,
+                purgeRegistry);
     }
 
     private AuditEvent recordOne(DefaultAuditService service, String actor, String action) {
@@ -307,5 +314,155 @@ class TamperEvidenceTest {
         assertThat(firstOnly.checkedPositions()).isEqualTo(1);
         assertThat(firstOnly.verifiedCount()).isEqualTo(1);
         assertThat(first.eventId()).isNotEqualTo(second.eventId());
+    }
+
+    @Test
+    @DisplayName("绕过接口直接删库：检出人为删除并定位到被删的那一条，不计入正常清理")
+    void manualDeletionIsDetectedAndLocated() {
+        DefaultAuditService service = auditService();
+        recordOne(service, "alice", "ORDER_CREATE");
+        AuditEvent victim = recordOne(service, "alice", "ORDER_UPDATE_PHONE");
+        recordOne(service, "bob", "ORDER_CANCEL");
+
+        // 模拟人为绕过接口直接删库：把已入链的第二条整条删掉
+        eventRepo.forceDelete(victim.eventId());
+
+        IntegrityReport report = verificationService.verify(null, null);
+        assertThat(report.intact()).isFalse();
+        assertThat(report.firstAnomaly()).isNotNull();
+        // 精确定位：从被删的那一条开始对不上
+        assertThat(report.firstAnomaly().position()).isEqualTo(2);
+        assertThat(report.firstAnomaly().eventId()).isEqualTo(victim.eventId());
+        assertThat(report.firstAnomaly().type()).isEqualTo(AnomalyType.RECORD_DELETED);
+        // 人为删除不能被算成“正常清理掉的条数”
+        assertThat(report.purgedCount()).isZero();
+        // 未被动过的另外两条仍然校验通过
+        assertThat(report.verifiedCount()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("人为删除与正常清理区分开：同一份报告里一个报异常、一个计入 purgedCount")
+    void manualDeletionIsDistinguishedFromRetentionPurge() {
+        properties.getRetention().setPurgeMode("DELETE");
+        properties.getRetention().setDays(90);
+        DefaultAuditService service = auditService();
+        recordOne(service, "alice", "ORDER_CREATE");
+        AuditEvent expired = recordOne(service, "alice", "ORDER_QUERY");
+        AuditEvent victim = recordOne(service, "bob", "ORDER_CANCEL");
+
+        // 第二条按留存策略正常清理（把它的落库时间模拟为过期）
+        AuditEvent expiredCopy = new AuditEvent(expired.eventId(), expired.requestId(),
+                expired.sequence(), expired.actor(), expired.action(), expired.resourceType(),
+                expired.resourceId(), expired.parameters(), expired.result(), expired.reason(),
+                Instant.now().minusSeconds(100L * 24 * 3600), expired.durationMillis(),
+                expired.async());
+        eventRepo.forceReplace(expiredCopy);
+        long purged = service.purgeExpired();
+        assertThat(purged).isEqualTo(1);
+
+        // 第三条被人为绕过接口直接删掉
+        eventRepo.forceDelete(victim.eventId());
+
+        IntegrityReport report = verificationService.verify(null, null);
+        assertThat(report.intact()).isFalse();
+        // 正常清理的那条：计入 purgedCount，不算异常
+        assertThat(report.purgedCount()).isEqualTo(1);
+        // 人为删除的那条：报 RECORD_DELETED 并定位到它
+        assertThat(report.firstAnomaly().position()).isEqualTo(3);
+        assertThat(report.firstAnomaly().eventId()).isEqualTo(victim.eventId());
+        assertThat(report.firstAnomaly().type()).isEqualTo(AnomalyType.RECORD_DELETED);
+        assertThat(report.verifiedCount()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("记录被整条换成别的：原记录按人为删除检出，换入的伪造记录不会顶替通过")
+    void recordReplacedByAnotherIsDetected() {
+        DefaultAuditService service = auditService();
+        recordOne(service, "alice", "ORDER_CREATE");
+        AuditEvent victim = recordOne(service, "alice", "ORDER_UPDATE_PHONE");
+
+        // 模拟攻击者删掉原记录、插入一条内容相近的伪造记录顶替
+        eventRepo.forceDelete(victim.eventId());
+        AuditEvent forged = new AuditEvent("evt-forged", victim.requestId(), victim.sequence(),
+                victim.actor(), victim.action(), victim.resourceType(), victim.resourceId(),
+                victim.parameters(), victim.result(), victim.reason(),
+                victim.timestamp(), victim.durationMillis(), victim.async());
+        eventRepo.saveIfAbsent(forged);
+
+        IntegrityReport report = verificationService.verify(null, null);
+        assertThat(report.intact()).isFalse();
+        // 原记录的链上环节还在、本体没了：按人为删除定位
+        assertThat(report.firstAnomaly().position()).isEqualTo(2);
+        assertThat(report.firstAnomaly().eventId()).isEqualTo(victim.eventId());
+        assertThat(report.firstAnomaly().type()).isEqualTo(AnomalyType.RECORD_DELETED);
+        // 伪造记录没有链上环节，不可能“校验通过”，只会被单列为未入链记录
+        assertThat(report.verifiedCount()).isEqualTo(1);
+        assertThat(report.legacyCount()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("按位置区间校验：只覆盖区间内环节，区间外的篡改不影响本次结论")
+    void verifyByPositionRange() {
+        DefaultAuditService service = auditService();
+        for (int i = 0; i < 5; i++) {
+            recordOne(service, "alice", "ACTION-" + i);
+        }
+
+        // 校验第 2..4 环：覆盖 3 环，全部通过
+        IntegrityReport report = verificationService.verifyRange(2, 4);
+        assertThat(report.intact()).isTrue();
+        assertThat(report.checkedPositions()).isEqualTo(3);
+        assertThat(report.verifiedCount()).isEqualTo(3);
+
+        // 区间外（第 5 环）被篡改：本次区间校验结论不受影响，全量校验能检出
+        String fifthId = chainRepo.findByPosition(5).orElseThrow().eventId();
+        AuditEvent fifth = eventRepo.findByEventId(fifthId).orElseThrow();
+        eventRepo.forceReplace(new AuditEvent(fifth.eventId(), fifth.requestId(),
+                fifth.sequence(), fifth.actor(), fifth.action(), fifth.resourceType(),
+                fifth.resourceId(), fifth.parameters(), OperationResult.FAILED, "被改",
+                fifth.timestamp(), fifth.durationMillis(), fifth.async()));
+
+        IntegrityReport rangeAgain = verificationService.verifyRange(2, 4);
+        assertThat(rangeAgain.intact()).isTrue();
+
+        IntegrityReport full = verificationService.verify(null, null);
+        assertThat(full.intact()).isFalse();
+        assertThat(full.firstAnomaly().position()).isEqualTo(5);
+        assertThat(full.firstAnomaly().type()).isEqualTo(AnomalyType.HASH_MISMATCH);
+    }
+
+    @Test
+    @DisplayName("按位置区间校验：区间内的人为删除/改动同样被检出并定位")
+    void verifyRangeDetectsAnomalyInsideRange() {
+        DefaultAuditService service = auditService();
+        AuditEvent first = recordOne(service, "alice", "ORDER_CREATE");
+        AuditEvent second = recordOne(service, "alice", "ORDER_UPDATE_PHONE");
+        recordOne(service, "bob", "ORDER_CANCEL");
+
+        eventRepo.forceDelete(second.eventId());
+
+        IntegrityReport report = verificationService.verifyRange(1, 3);
+        assertThat(report.intact()).isFalse();
+        assertThat(report.firstAnomaly().position()).isEqualTo(2);
+        assertThat(report.firstAnomaly().eventId()).isEqualTo(second.eventId());
+        assertThat(report.firstAnomaly().type()).isEqualTo(AnomalyType.RECORD_DELETED);
+        assertThat(report.checkedPositions()).isEqualTo(3);
+        assertThat(report.verifiedCount()).isEqualTo(2);
+        assertThat(first.eventId()).isNotEqualTo(second.eventId());
+    }
+
+    @Test
+    @DisplayName("按位置区间校验：区间首环的前驱在区间外也能正确校验衔接")
+    void verifyRangeChecksLinkageAcrossRangeBoundary() {
+        DefaultAuditService service = auditService();
+        recordOne(service, "alice", "ORDER_CREATE");
+        recordOne(service, "alice", "ORDER_QUERY");
+        recordOne(service, "bob", "ORDER_CANCEL");
+
+        // 从第 2 环开始校验：其前驱（第 1 环）在区间外，应回查后正常衔接
+        IntegrityReport report = verificationService.verifyRange(2, 3);
+        assertThat(report.intact()).isTrue();
+        assertThat(report.checkedPositions()).isEqualTo(2);
+        assertThat(report.verifiedCount()).isEqualTo(2);
     }
 }

@@ -19,7 +19,8 @@ public interface AuditEventRepository {
     long count(String requestId, String actor, String action,
                String resourceType, String resourceId);
 
-    long deleteOlderThan(Instant cutoff);
+    /** 物理删除过期记录，返回被删记录的 eventId 列表（供留存删除登记，区分正常清理与人为删除）。 */
+    List<String> deleteOlderThan(Instant cutoff);
 
     /** 将过期记录匿名化（actor 置为 deleted@retention、参数清空），记录本身保留。返回被匿名化的记录。 */
     List<AuditEvent> anonymizeOlderThan(Instant cutoff);

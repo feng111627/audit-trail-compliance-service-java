@@ -7,6 +7,8 @@ import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.Aud
 import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.HashChainService;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.InMemoryAnonymizationRegistry;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.InMemoryChainEntryRepository;
+import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.InMemoryPurgeRegistry;
+import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.PurgeRegistry;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.masking.MaskingService;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.model.AuditEvent;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.model.AuditPage;
@@ -38,6 +40,7 @@ public class DefaultAuditService implements AuditService {
     private final AuditProperties properties;
     private final HashChainService hashChainService;
     private final AnonymizationRegistry anonymizationRegistry;
+    private final PurgeRegistry purgeRegistry;
 
     @Autowired
     public DefaultAuditService(AuditEventRepository repository,
@@ -45,13 +48,15 @@ public class DefaultAuditService implements AuditService {
                                AuditAccessControl accessControl,
                                AuditProperties properties,
                                HashChainService hashChainService,
-                               AnonymizationRegistry anonymizationRegistry) {
+                               AnonymizationRegistry anonymizationRegistry,
+                               PurgeRegistry purgeRegistry) {
         this.repository = repository;
         this.maskingService = maskingService;
         this.accessControl = accessControl;
         this.properties = properties;
         this.hashChainService = hashChainService;
         this.anonymizationRegistry = anonymizationRegistry;
+        this.purgeRegistry = purgeRegistry;
     }
 
     /** 便捷构造：不带外部链组件时使用独立的内存链（主要供不关注防篡改的既有单测）。 */
@@ -61,7 +66,8 @@ public class DefaultAuditService implements AuditService {
                                AuditProperties properties) {
         this(repository, maskingService, accessControl, properties,
                 new HashChainService(new InMemoryChainEntryRepository()),
-                new InMemoryAnonymizationRegistry());
+                new InMemoryAnonymizationRegistry(),
+                new InMemoryPurgeRegistry());
     }
 
     @Override
@@ -172,7 +178,10 @@ public class DefaultAuditService implements AuditService {
             }
             return anonymized.size();
         }
-        return repository.deleteOlderThan(cutoff);
+        // 正常物理删除要登记 eventId，供完整性校验把“到点清理”与“人为删除”区分开。
+        List<String> deletedIds = repository.deleteOlderThan(cutoff);
+        deletedIds.forEach(purgeRegistry::registerPurged);
+        return deletedIds.size();
     }
 
     private static int clampLimit(int limit) {

@@ -64,15 +64,15 @@ public class InMemoryAuditEventRepository implements AuditEventRepository {
     }
 
     @Override
-    public long deleteOlderThan(Instant cutoff) {
+    public List<String> deleteOlderThan(Instant cutoff) {
         List<String> expiredIds = store.values().stream()
                 .filter(e -> e.timestamp().isBefore(cutoff))
                 .map(AuditEvent::eventId)
                 .toList();
-        long removed = 0;
+        List<String> removed = new java.util.ArrayList<>();
         for (String id : expiredIds) {
             if (store.remove(id) != null) {
-                removed++;
+                removed.add(id);
             }
         }
         return removed;
@@ -107,6 +107,14 @@ public class InMemoryAuditEventRepository implements AuditEventRepository {
      */
     public void forceReplace(AuditEvent event) {
         store.put(event.eventId(), event);
+    }
+
+    /**
+     * 模拟“绕过接口直接删库”的物理删除：仅用于测试/演示防篡改校验，
+     * 正常业务路径不会调用（留存清理走 deleteOlderThan 并做登记）。
+     */
+    public void forceDelete(String eventId) {
+        store.remove(eventId);
     }
 
     @Override

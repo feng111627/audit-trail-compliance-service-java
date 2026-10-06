@@ -33,6 +33,8 @@ public record IntegrityReport(
         /** 记录内容被改动，重算哈希与链上登记值不一致。 */
         HASH_MISMATCH,
         /** 链上相邻环节的哈希衔接断开（环节被删/换/重排）。 */
-        CHAIN_LINK_BROKEN
+        CHAIN_LINK_BROKEN,
+        /** 已入链的记录本体消失，且未登记为留存策略清理，疑似人为删除。 */
+        RECORD_DELETED
     }
 }

@@ -1,8 +1,8 @@
 package com.github.feng111627.audittrailcomplianceservicejava.audit.integrity;
 
-import com.github.feng111627.audittrailcomplianceservicejava.audit.model.AuditEvent;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.IntegrityReport.AnomalyType;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.integrity.IntegrityReport.FirstAnomaly;
+import com.github.feng111627.audittrailcomplianceservicejava.audit.model.AuditEvent;
 import com.github.feng111627.audittrailcomplianceservicejava.audit.repository.AuditEventRepository;
 import java.time.Instant;
 import java.util.List;
@@ -10,7 +10,7 @@ import java.util.Optional;
 import org.springframework.stereotype.Service;
 
 /**
- * 完整性校验：按时间范围对哈希链做一次可验证的重放。
+ * 完整性校验：对哈希链做一次可验证的重放，支持按时间范围或按链上位置区间。
  *
  * <p>对范围内每个链上环节做两类检查：
  * <ol>
@@ -20,10 +20,13 @@ import org.springframework.stereotype.Service;
  *       否则说明记录事后被改动。</li>
  * </ol>
  *
- * <p>不算异常的两类情况，单独计数上报：
+ * <p>人为删除可检出：链上环节在、记录本体不在，且未登记为留存策略清理的，
+ * 报 {@link AnomalyType#RECORD_DELETED} 并定位到该环——不会被混进“正常清理”。
+ *
+ * <p>不算异常的两类情况，单独计数上报、与篡改分开：
  * <ul>
  *   <li>历史遗留：记录存在但没有链上环节（能力上线前已落库），计入 legacyCount；</li>
- *   <li>正常清理：链上环节在、记录已被留存策略物理删除（purgedCount），
+ *   <li>正常清理：链上环节在、记录已被留存策略物理删除且已登记（purgedCount），
  *       或记录被正常匿名化且与匿名化登记哈希一致（anonymizedCount）。</li>
  * </ul>
  *
@@ -38,13 +41,16 @@ public class IntegrityVerificationService {
     private final ChainEntryRepository chainRepository;
     private final AuditEventRepository eventRepository;
     private final AnonymizationRegistry anonymizationRegistry;
+    private final PurgeRegistry purgeRegistry;
 
     public IntegrityVerificationService(ChainEntryRepository chainRepository,
                                         AuditEventRepository eventRepository,
-                                        AnonymizationRegistry anonymizationRegistry) {
+                                        AnonymizationRegistry anonymizationRegistry,
+                                        PurgeRegistry purgeRegistry) {
         this.chainRepository = chainRepository;
         this.eventRepository = eventRepository;
         this.anonymizationRegistry = anonymizationRegistry;
+        this.purgeRegistry = purgeRegistry;
     }
 
     /**
@@ -55,13 +61,7 @@ public class IntegrityVerificationService {
         Instant effectiveFrom = from == null ? Instant.EPOCH : from;
         Instant effectiveTo = to == null ? Instant.MAX : to;
 
-        long verified = 0;
-        long anonymized = 0;
-        long purged = 0;
-        long checked = 0;
-        FirstAnomaly firstAnomaly = null;
-
-        // —— 链上环节：分批扫描，逐环做衔接与内容校验 ——
+        Verdict verdict = new Verdict();
         ChainEntry previousEntry = null;
         long offset = 0;
         while (true) {
@@ -72,42 +72,89 @@ public class IntegrityVerificationService {
             }
             offset += batch.size();
             for (ChainEntry entry : batch) {
-                checked++;
-                ChainEntry predecessor = predecessorOf(entry, previousEntry);
-                FirstAnomaly linkAnomaly = checkLinkage(entry, predecessor);
-                if (linkAnomaly != null && firstAnomaly == null) {
-                    firstAnomaly = linkAnomaly;
-                }
-
-                Optional<AuditEvent> event = eventRepository.findByEventId(entry.eventId());
-                if (event.isEmpty()) {
-                    // 记录已不在：留存策略物理删除属于正常清理，不算篡改。
-                    purged++;
-                } else {
-                    String recomputed = AuditEventHash.compute(event.get(), entry.previousHash());
-                    if (recomputed.equals(entry.entryHash())) {
-                        verified++;
-                    } else if (isProperlyAnonymized(entry, recomputed)) {
-                        verified++;
-                        anonymized++;
-                    } else if (firstAnomaly == null) {
-                        firstAnomaly = new FirstAnomaly(entry.position(), entry.eventId(),
-                                AnomalyType.HASH_MISMATCH,
-                                "记录内容与链上登记哈希不一致，疑似落库后被改动");
-                    }
-                }
-                previousEntry = entry;
+                previousEntry = checkEntry(entry, previousEntry, verdict);
             }
             if (batch.size() < BATCH_SIZE) {
                 break;
             }
         }
 
-        // —— 历史遗留：范围内有记录但尚未入链的，单独计数，不算篡改 ——
+        // 历史遗留：范围内有记录但尚未入链的，单独计数，不算篡改。
         long legacy = countLegacy(effectiveFrom, effectiveTo);
+        return verdict.toReport(legacy);
+    }
 
-        return new IntegrityReport(firstAnomaly == null, verified, anonymized,
-                purged, legacy, checked, firstAnomaly);
+    /**
+     * 校验链上位置在 [fromPosition, toPosition]（闭区间）的环节。
+     * 范围首环的前驱按 position 回查，不在范围内也能正确校验衔接。
+     */
+    public IntegrityReport verifyRange(long fromPosition, long toPosition) {
+        if (fromPosition < 1 || toPosition < fromPosition) {
+            throw new IllegalArgumentException(
+                    "非法的位置区间: [" + fromPosition + ", " + toPosition + "]");
+        }
+
+        Verdict verdict = new Verdict();
+        ChainEntry previousEntry = null;
+        long cursor = fromPosition;
+        while (cursor <= toPosition) {
+            int limit = (int) Math.min(BATCH_SIZE, toPosition - cursor + 1);
+            List<ChainEntry> batch = chainRepository.findRange(cursor, limit);
+            if (batch.isEmpty()) {
+                break;
+            }
+            for (ChainEntry entry : batch) {
+                if (entry.position() > toPosition) {
+                    break;
+                }
+                previousEntry = checkEntry(entry, previousEntry, verdict);
+            }
+            cursor = batch.get(batch.size() - 1).position() + 1;
+            if (batch.size() < limit) {
+                break;
+            }
+        }
+        // 按位置区间校验时，历史遗留记录没有链上位置，不在本模式覆盖范围内。
+        return verdict.toReport(0);
+    }
+
+    /**
+     * 校验单个环节：先做链衔接检查，再做内容一致性检查。
+     * 返回本环（作为下一环扫描顺序相邻时的前驱，避免重复回查）。
+     */
+    private ChainEntry checkEntry(ChainEntry entry, ChainEntry previousEntry, Verdict verdict) {
+        verdict.checked++;
+        ChainEntry predecessor = predecessorOf(entry, previousEntry);
+        FirstAnomaly linkAnomaly = checkLinkage(entry, predecessor);
+        if (linkAnomaly != null && verdict.firstAnomaly == null) {
+            verdict.firstAnomaly = linkAnomaly;
+        }
+
+        Optional<AuditEvent> event = eventRepository.findByEventId(entry.eventId());
+        if (event.isEmpty()) {
+            if (purgeRegistry.isPurged(entry.eventId())) {
+                // 留存策略到点物理删除：已登记，属于正常清理，不算篡改。
+                verdict.purged++;
+            } else if (verdict.firstAnomaly == null) {
+                // 记录本体消失且未登记为正常清理：疑似人为绕过接口直接删库。
+                verdict.firstAnomaly = new FirstAnomaly(entry.position(), entry.eventId(),
+                        AnomalyType.RECORD_DELETED,
+                        "已入链的记录本体不存在，且未登记为留存策略清理，疑似人为删除");
+            }
+        } else {
+            String recomputed = AuditEventHash.compute(event.get(), entry.previousHash());
+            if (recomputed.equals(entry.entryHash())) {
+                verdict.verified++;
+            } else if (isProperlyAnonymized(entry, recomputed)) {
+                verdict.verified++;
+                verdict.anonymized++;
+            } else if (verdict.firstAnomaly == null) {
+                verdict.firstAnomaly = new FirstAnomaly(entry.position(), entry.eventId(),
+                        AnomalyType.HASH_MISMATCH,
+                        "记录内容与链上登记哈希不一致，疑似落库后被改动");
+            }
+        }
+        return entry;
     }
 
     /** 取本环的前驱：扫描顺序相邻时直接复用上一环，否则按 position 回查（范围内可能有空洞）。 */
@@ -165,5 +212,19 @@ public class IntegrityVerificationService {
             }
         }
         return legacy;
+    }
+
+    /** 一次校验的累计判定：分项计数 + 第一处异常。 */
+    private static final class Verdict {
+        private long verified;
+        private long anonymized;
+        private long purged;
+        private long checked;
+        private FirstAnomaly firstAnomaly;
+
+        private IntegrityReport toReport(long legacy) {
+            return new IntegrityReport(firstAnomaly == null, verified, anonymized,
+                    purged, legacy, checked, firstAnomaly);
+        }
     }
 }
